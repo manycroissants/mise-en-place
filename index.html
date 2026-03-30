@@ -708,12 +708,73 @@ function updateNutritionSummary() {
 
 function autoFillPlan() {
   if (!state.dishes.length) { toast('Add dishes first.','error'); return; }
-  const plan={};
-  DAYS.forEach(d=>{ MTIMES.forEach(mt=>{ if(!state.weekConfig[d]?.[mt])return; const key=`${d}-${mt}`, prefs=state.preferences[mt]||{}, sel=[];
-    TYPES.forEach(t=>{ const cnt=prefs[t]||0; if(!cnt)return; const pool=[...state.dishes.filter(x=>x.meal_type===t)].sort(()=>Math.random()-0.5); pool.slice(0,cnt).forEach(x=>{ if(!sel.includes(x.id))sel.push(x.id); }); });
-    plan[key]=sel;
-  }); });
-  state.mealPlan=plan; renderPlanPage(); toast('Plan auto-filled!','success');
+
+  // ── Build penalty sets ──
+  // 1. Dishes used in the PREVIOUS week's saved plan (high penalty)
+  const prevWeekLabel = getWeekLabel(state.weekOffset - 1);
+  const prevPlan = state.savedPlans.find(p => p.week_label === prevWeekLabel);
+  const prevWeekIds = new Set();
+  if (prevPlan) {
+    Object.values(prevPlan.plan || {}).forEach(ids => (ids||[]).forEach(id => prevWeekIds.add(id)));
+  }
+
+  // 2. Dishes already chosen earlier in THIS fill pass (tracked live)
+  // We count how many times each dish is used in the current plan being built.
+  const thisWeekUsageCount = {};
+
+  // Scoring: lower = more preferred
+  // +100 if used in previous week
+  // +10 * (times already used this week) — strongly prefer dishes not yet used this week
+  function dishScore(dishId) {
+    const prevPenalty = prevWeekIds.has(dishId) ? 10 : 0;
+    const repeatPenalty = (thisWeekUsageCount[dishId] || 0) * 10;
+    // Add small random jitter (0–3) so equal-score dishes aren't always in the same order
+    const jitter = Math.random() * 3;
+    return prevPenalty + repeatPenalty + jitter;
+  }
+
+  const plan = {};
+
+  // Process slots in a fixed order (Mon–Sun, lunch then dinner)
+  DAYS.forEach(d => {
+    MTIMES.forEach(mt => {
+      if (!state.weekConfig[d]?.[mt]) return;
+      const key = `${d}-${mt}`;
+      const prefs = state.preferences[mt] || {};
+      const sel = [];
+
+      TYPES.forEach(t => {
+        const cnt = prefs[t] || 0;
+        if (!cnt) return;
+
+        // Candidates of this type, sorted by score ascending (least-used / least-repeated first)
+        const candidates = state.dishes
+          .filter(x => x.meal_type === t && !sel.includes(x.id))
+          .map(x => ({ id: x.id, score: dishScore(x.id) }))
+          .sort((a, b) => a.score - b.score);
+
+        // Pick the top `cnt` candidates
+        candidates.slice(0, cnt).forEach(c => {
+          sel.push(c.id);
+          thisWeekUsageCount[c.id] = (thisWeekUsageCount[c.id] || 0) + 1;
+        });
+      });
+
+      plan[key] = sel;
+    });
+  });
+
+  state.mealPlan = plan;
+  renderPlanPage();
+
+  // Summarise what we avoided
+  const avoidedPrev = Object.values(plan).flat().filter(id => prevWeekIds.has(id)).length;
+  const msg = prevPlan && avoidedPrev === 0
+    ? 'Auto-filled! No repeats from last week. ✓'
+    : prevPlan && avoidedPrev > 0
+      ? `Auto-filled — ${avoidedPrev} dish${avoidedPrev>1?'es':''} repeated from last week (library too small to fully avoid).`
+      : 'Plan auto-filled with minimal repetition!';
+  toast(msg, 'success');
 }
 
 async function saveMealPlan() {
