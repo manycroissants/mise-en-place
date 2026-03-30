@@ -719,18 +719,32 @@ function autoFillPlan() {
   }
 
   // 2. Dishes already chosen earlier in THIS fill pass (tracked live)
-  // We count how many times each dish is used in the current plan being built.
   const thisWeekUsageCount = {};
 
+  // 3. Track which dish IDs appear in each day slot so we can penalise same-day and previous-day reuse
+  // priorIds(day) returns dish IDs already used today (other meal slot) + all of yesterday
+  const planByDay = {}; // { 'Monday': Set<dishId>, ... }
+  function priorIds(day) {
+    const idx = DAYS.indexOf(day);
+    const ids = new Set();
+    // Same day (e.g. lunch already picked when scoring dinner)
+    (planByDay[day] || new Set()).forEach(id => ids.add(id));
+    // Day before
+    if (idx > 0) (planByDay[DAYS[idx - 1]] || new Set()).forEach(id => ids.add(id));
+    return ids;
+  }
+
   // Scoring: lower = more preferred
-  // +100 if used in previous week
-  // +10 * (times already used this week) — strongly prefer dishes not yet used this week
-  function dishScore(dishId) {
-    const prevPenalty = prevWeekIds.has(dishId) ? 10 : 0;
-    const repeatPenalty = (thisWeekUsageCount[dishId] || 0) * 10;
-    // Add small random jitter (0–3) so equal-score dishes aren't always in the same order
-    const jitter = Math.random() * 3;
-    return prevPenalty + repeatPenalty + jitter;
+  // +5  if used in previous week's saved plan
+  // +15 per use already this week (first repeat = +15, second = +30, etc.)
+  // +30 if used in the same day (other meal slot) or the day before
+  // +0–7 random jitter
+  function dishScore(dishId, priorIdSet) {
+    const prevPenalty    = prevWeekIds.has(dishId) ? 5 : 0;
+    const repeatPenalty  = (thisWeekUsageCount[dishId] || 0) * 15;
+    const proximityPenalty = priorIdSet.has(dishId) ? 30 : 0;
+    const jitter         = Math.random() * 7;
+    return prevPenalty + repeatPenalty + proximityPenalty + jitter;
   }
 
   const plan = {};
@@ -742,21 +756,25 @@ function autoFillPlan() {
       const key = `${d}-${mt}`;
       const prefs = state.preferences[mt] || {};
       const sel = [];
+      const adjIds = priorIds(d);
 
       TYPES.forEach(t => {
         const cnt = prefs[t] || 0;
         if (!cnt) return;
 
-        // Candidates of this type, sorted by score ascending (least-used / least-repeated first)
+        // Candidates of this type, sorted by score ascending
         const candidates = state.dishes
           .filter(x => x.meal_type === t && !sel.includes(x.id))
-          .map(x => ({ id: x.id, score: dishScore(x.id) }))
+          .map(x => ({ id: x.id, score: dishScore(x.id, adjIds) }))
           .sort((a, b) => a.score - b.score);
 
         // Pick the top `cnt` candidates
         candidates.slice(0, cnt).forEach(c => {
           sel.push(c.id);
           thisWeekUsageCount[c.id] = (thisWeekUsageCount[c.id] || 0) + 1;
+          // Record in planByDay so the next day can check adjacency
+          if (!planByDay[d]) planByDay[d] = new Set();
+          planByDay[d].add(c.id);
         });
       });
 
