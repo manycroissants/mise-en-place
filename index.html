@@ -531,8 +531,10 @@ async function handleSignup() {
       setSession(d.access_token, uid, userEmail, d.refresh_token);
       enterApp();
     } else {
-      showAuthError('Account created! Please sign in.');
+      // Email confirmation required — pre-fill the login email so user doesn't have to retype
+      showAuthError('Account created! Please check your email to confirm, then sign in.');
       switchAuthTab('login');
+      document.getElementById('login-email').value = email;
     }
   } catch(e) { showAuthError(e.message); }
   setAuthLoading('signup-btn', false);
@@ -576,9 +578,9 @@ async function enterApp() {
 async function loadAll() {
   try {
     const [dishes,configs,plans] = await Promise.all([
-      db(`meal_library?user_id=eq.${currentUserId}&order=created_at.asc`),
-      db(`meal_weekly_config?user_id=eq.${currentUserId}&order=created_at.desc&limit=1`),
-      db(`meal_plans?user_id=eq.${currentUserId}&order=created_at.desc`)
+      db(`meal_library?select=*&user_id=eq.${currentUserId}&order=created_at.asc`),
+      db(`meal_weekly_config?select=*&user_id=eq.${currentUserId}&order=created_at.desc&limit=1`),
+      db(`meal_plans?select=*&user_id=eq.${currentUserId}&order=created_at.desc`)
     ]);
     state.dishes = dishes||[];
     state.savedPlans = plans||[];
@@ -588,7 +590,14 @@ async function loadAll() {
       state.preferences = (raw.lunch && raw.dinner) ? raw : defaultPrefs();
     }
     if (plans?.length) state.mealPlan = plans[0].plan || {};
-  } catch(e) { toast('Load error: '+e.message,'error'); }
+  } catch(e) {
+    console.error('loadAll error:', e);
+    toast('Load error: '+e.message,'error');
+    // Dead token — force re-login rather than staying stuck on empty UI
+    if (e.message && /JWT|401|expired|invalid/i.test(e.message)) {
+      setTimeout(() => handleLogout(), 2000);
+    }
+  }
 }
 
 function navigate(page) {
@@ -1049,10 +1058,32 @@ function toast(msg,type='success') { const el=document.createElement('div'); el.
       authToken = s.token;
       currentUserId = s.userId;
       currentUserEmail = s.email;
-      // Try refresh separately — never let it block enterApp
-      if (s.refreshToken) {
-        try { await tryRefreshToken(); } catch(e) {}
+
+      // Check if the stored JWT is expired
+      const jwt = decodeJWT(s.token);
+      const nowSec = Math.floor(Date.now() / 1000);
+      const isExpired = jwt.exp && jwt.exp < nowSec;
+
+      if (isExpired) {
+        // Token is expired — try to refresh. If refresh fails, force re-login.
+        if (s.refreshToken) {
+          const refreshed = await tryRefreshToken().catch(() => false);
+          if (!refreshed) {
+            localStorage.removeItem('mep_session');
+            document.getElementById('auth-screen').style.display = 'flex';
+            return;
+          }
+        } else {
+          // No refresh token and access token is expired — must re-login
+          localStorage.removeItem('mep_session');
+          document.getElementById('auth-screen').style.display = 'flex';
+          return;
+        }
+      } else if (s.refreshToken) {
+        // Token still valid but try a proactive refresh in the background
+        tryRefreshToken().catch(() => {});
       }
+
       enterApp();
       return;
     } catch(e) {
