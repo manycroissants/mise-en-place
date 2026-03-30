@@ -419,29 +419,8 @@ const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 
 let authToken = null, currentUserId = null, currentUserEmail = null;
 
-// --- UTILITIES ---
-function esc(str) {
-  if (!str) return '';
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
-}
-
-function typeClass(t) { return 'type-' + t.replace(/\s+/g, '-'); }
-
-function toast(msg, type = 'success') {
-  const el = document.createElement('div');
-  el.className = `toast ${type}`;
-  el.textContent = msg;
-  const container = document.getElementById('toast-container');
-  if (container) {
-    container.appendChild(el);
-    setTimeout(() => el.remove(), 3000);
-  }
-}
-
-// --- DATABASE CORE ---
 async function db(path, opts = {}) {
+  // Cleanly separate our custom keys from real fetch init properties
   const { prefer, headers: extraHeaders, ...fetchInit } = opts;
   const headers = {
     apikey: SB_KEY,
@@ -451,30 +430,21 @@ async function db(path, opts = {}) {
     ...extraHeaders
   };
 
-  try {
-    const res = await fetch(`${SB_URL}/rest/v1/${path}`, { ...fetchInit, headers });
+  const res = await fetch(`${SB_URL}/rest/v1/${path}`, { ...fetchInit, headers });
 
-    if (res.status === 401) {
-      const refreshed = await tryRefreshToken();
-      if (refreshed) {
-        const headers2 = { ...headers, Authorization: `Bearer ${authToken}` };
-        const res2 = await fetch(`${SB_URL}/rest/v1/${path}`, { ...fetchInit, headers: headers2 });
-        const t2 = await res2.text(); return t2 ? JSON.parse(t2) : null;
-      }
-      handleLogout(); throw new Error('Session expired.');
+  if (res.status === 401) {
+    const refreshed = await tryRefreshToken();
+    if (refreshed) {
+      // Retry with the new token
+      const headers2 = { ...headers, Authorization: `Bearer ${authToken}` };
+      const res2 = await fetch(`${SB_URL}/rest/v1/${path}`, { ...fetchInit, headers: headers2 });
+      if (!res2.ok) { const e = await res2.json().catch(()=>({})); throw new Error(e.message || res2.statusText); }
+      const t2 = await res2.text(); return t2 ? JSON.parse(t2) : null;
     }
-
-    if (!res.ok) {
-      const e = await res.json().catch(() => ({}));
-      throw new Error(e.message || res.statusText);
-    }
-
-    const t = await res.text();
-    return t ? JSON.parse(t) : null;
-  } catch (err) {
-    console.error("DB Error:", err);
-    throw err;
+    handleLogout(); throw new Error('Session expired. Please sign in again.');
   }
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.message || res.statusText); }
+  const t = await res.text(); return t ? JSON.parse(t) : null;
 }
 
 async function tryRefreshToken() {
@@ -489,21 +459,16 @@ async function tryRefreshToken() {
     });
     const d = await r.json();
     if (d.error || !d.access_token) return false;
-    const uid = d.user?.id || s.userId;
+    // user object may be at d.user or absent — fall back to what we already know
+    const uid   = d.user?.id    || s.userId;
     const email = d.user?.email || s.email;
     setSession(d.access_token, uid, email, d.refresh_token || s.refreshToken);
     return true;
-  } catch (e) { return false; }
+  } catch(e) { return false; }
 }
 
-function decodeJWT(token) {
-  try {
-    const payload = token.split('.')[1];
-    return JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
-  } catch (e) { return {}; }
-}
-
-// --- IMAGE HANDLING ---
+// ── IMAGE COMPRESSION ──
+// Compress image to max 200x200, quality 0.6 before storing as base64
 function compressImage(file, maxSize = 200, quality = 0.6) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -522,24 +487,30 @@ function compressImage(file, maxSize = 200, quality = 0.6) {
   });
 }
 
-// --- AUTH ---
+// Decode JWT payload — most reliable source of uid regardless of API response shape
+function decodeJWT(token) {
+  try {
+    const payload = token.split('.')[1];
+    return JSON.parse(atob(payload.replace(/-/g,'+').replace(/_/g,'/')));
+  } catch(e) { return {}; }
+}
+
+// AUTH
 async function handleLogin() {
   const email = document.getElementById('login-email').value.trim();
   const pwd = document.getElementById('login-password').value;
-  if (!email || !pwd) { showAuthError("Enter email and password"); return; }
   setAuthLoading('login-btn', true);
   try {
-    const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, { 
-      method: 'POST', 
-      headers: { apikey: SB_KEY, 'Content-Type': 'application/json' }, 
-      body: JSON.stringify({ email, password: pwd }) 
-    });
+    const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, { method:'POST', headers:{apikey:SB_KEY,'Content-Type':'application/json'}, body:JSON.stringify({email,password:pwd}) });
     const d = await r.json();
     if (d.error) throw new Error(d.error_description || d.error);
     const jwt = decodeJWT(d.access_token);
-    setSession(d.access_token, d.user?.id || jwt.sub, d.user?.email || jwt.email || email, d.refresh_token);
+    const uid = d.user?.id || jwt.sub;
+    const userEmail = d.user?.email || jwt.email || email;
+    if (!uid) throw new Error('Could not determine user ID. Please try again.');
+    setSession(d.access_token, uid, userEmail, d.refresh_token);
     enterApp();
-  } catch (e) { showAuthError(e.message); }
+  } catch(e) { showAuthError(e.message); }
   setAuthLoading('login-btn', false);
 }
 
@@ -547,369 +518,611 @@ async function handleSignup() {
   const name = document.getElementById('signup-name').value.trim();
   const email = document.getElementById('signup-email').value.trim();
   const pwd = document.getElementById('signup-password').value;
-  if (!name || !email || !pwd) { showAuthError('Fill in all fields.'); return; }
+  if (!name||!email||!pwd) { showAuthError('Please fill in all fields.'); return; }
   setAuthLoading('signup-btn', true);
   try {
-    const r = await fetch(`${SB_URL}/auth/v1/signup`, { 
-      method: 'POST', 
-      headers: { apikey: SB_KEY, 'Content-Type': 'application/json' }, 
-      body: JSON.stringify({ email, password: pwd, data: { full_name: name } }) 
-    });
+    const r = await fetch(`${SB_URL}/auth/v1/signup`, { method:'POST', headers:{apikey:SB_KEY,'Content-Type':'application/json'}, body:JSON.stringify({email,password:pwd,data:{full_name:name}}) });
     const d = await r.json();
     if (d.error) throw new Error(d.error_description || d.error);
     if (d.access_token) {
       const jwt = decodeJWT(d.access_token);
-      setSession(d.access_token, d.user?.id || jwt.sub, d.user?.email || jwt.email || email, d.refresh_token);
+      const uid = d.user?.id || jwt.sub;
+      const userEmail = d.user?.email || jwt.email || email;
+      setSession(d.access_token, uid, userEmail, d.refresh_token);
       enterApp();
     } else {
-      showAuthError('Check your email to confirm signup!');
+      // Email confirmation required — pre-fill the login email so user doesn't have to retype
+      showAuthError('Account created! Please check your email to confirm, then sign in.');
       switchAuthTab('login');
+      document.getElementById('login-email').value = email;
     }
-  } catch (e) { showAuthError(e.message); }
+  } catch(e) { showAuthError(e.message); }
   setAuthLoading('signup-btn', false);
 }
 
 function setSession(token, uid, email, refreshToken) {
-  authToken = token; currentUserId = uid; currentUserEmail = email;
-  localStorage.setItem('mep_session', JSON.stringify({ token, userId: uid, email, refreshToken }));
+  authToken=token; currentUserId=uid; currentUserEmail=email;
+  localStorage.setItem('mep_session', JSON.stringify({token, userId:uid, email, refreshToken: refreshToken||null}));
 }
+function handleLogout() { localStorage.removeItem('mep_session'); authToken=null; currentUserId=null; state=freshState(); document.getElementById('app').style.display='none'; document.getElementById('auth-screen').style.display='flex'; }
+function setAuthLoading(id, on) { const b=document.getElementById(id); b.disabled=on; b.innerHTML=on?'<span class="loading-spinner"></span>':(id==='login-btn'?'Sign in':'Create account'); }
+function showAuthError(m) { const e=document.getElementById('auth-error'); e.textContent=m; e.style.display='block'; }
+function switchAuthTab(tab) { document.getElementById('auth-error').style.display='none'; document.querySelectorAll('.auth-tab').forEach((t,i)=>t.classList.toggle('active',(i===0)===(tab==='login'))); document.getElementById('login-form').style.display=tab==='login'?'block':'none'; document.getElementById('signup-form').style.display=tab==='signup'?'block':'none'; }
 
-function handleLogout() { 
-  localStorage.removeItem('mep_session'); 
-  authToken = null; currentUserId = null; state = freshState(); 
-  document.getElementById('app').style.display = 'none'; 
-  document.getElementById('auth-screen').style.display = 'flex'; 
-}
+// STATE
+const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+const MTIMES = ['lunch','dinner'];
+const TYPES = ['protein','vegetable','carbs','soup','small dishes'];
+const EMOJI = {protein:'🥩',vegetable:'🥦',carbs:'🍚',soup:'🍜','small dishes':'🥢'};
 
-function setAuthLoading(id, on) {
-  const b = document.getElementById(id);
-  if (b) {
-    b.disabled = on;
-    b.innerHTML = on ? '<span class="loading-spinner"></span>' : (id === 'login-btn' ? 'Sign in' : 'Create account');
-  }
-}
-
-function showAuthError(m) {
-  const e = document.getElementById('auth-error');
-  if (e) { e.textContent = m; e.style.display = 'block'; }
-}
-
-function switchAuthTab(tab) {
-  document.getElementById('auth-error').style.display = 'none';
-  document.querySelectorAll('.auth-tab').forEach((t, i) => t.classList.toggle('active', (i === 0) === (tab === 'login')));
-  document.getElementById('login-form').style.display = tab === 'login' ? 'block' : 'none';
-  document.getElementById('signup-form').style.display = tab === 'signup' ? 'block' : 'none';
-}
-
-// --- STATE ---
-const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-const MTIMES = ['lunch', 'dinner'];
-const TYPES = ['protein', 'vegetable', 'carbs', 'soup', 'small dishes'];
-const EMOJI = { protein: '🥩', vegetable: '🥦', carbs: '🍚', soup: '🍜', 'small dishes': '🥢' };
-
-function defaultPrefs() {
-  const p = {}; MTIMES.forEach(m => { p[m] = { protein: 2, vegetable: 1, carbs: 0, soup: 0, 'small dishes': 0 }; });
-  return p;
-}
-
-function defaultConfig() {
-  const c = {}; DAYS.forEach(d => { c[d] = { lunch: false, dinner: false }; });
-  return c;
-}
-
-function freshState() {
-  return { dishes: [], weekConfig: defaultConfig(), preferences: defaultPrefs(), mealPlan: {}, savedPlans: [], weekOffset: 0, editingDishId: null, pendingImageFile: null, selectedPlanId: null };
-}
-
+function defaultPrefs() { const p={}; MTIMES.forEach(m=>{p[m]={protein:2,vegetable:1,carbs:0,soup:0};}); return p; }
+function defaultConfig() { const c={}; DAYS.forEach(d=>{c[d]={lunch:false,dinner:false};}); return c; }
+function freshState() { return {dishes:[],weekConfig:defaultConfig(),preferences:defaultPrefs(),mealPlan:{},savedPlans:[],weekOffset:0,editingDishId:null,pendingImageFile:null,selectedPlanId:null}; }
 let state = freshState();
 
-function getWeekLabel(offset = 0) {
-  const now = new Date(), day = now.getDay(), diff = now.getDate() - day + (day === 0 ? -6 : 1) + offset * 7;
-  const mon = new Date(now); mon.setDate(diff); const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
-  const fmt = d => d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+function getWeekLabel(offset=0) {
+  const now=new Date(), day=now.getDay(), diff=now.getDate()-day+(day===0?-6:1)+offset*7;
+  const mon=new Date(now); mon.setDate(diff); const sun=new Date(mon); sun.setDate(mon.getDate()+6);
+  const fmt=d=>d.toLocaleDateString('en-GB',{day:'numeric',month:'short'});
   return `${fmt(mon)} – ${fmt(sun)}`;
 }
 
 async function enterApp() {
-  document.getElementById('auth-screen').style.display = 'none';
-  document.getElementById('app').style.display = 'flex';
-  document.getElementById('user-badge').textContent = currentUserEmail;
-  await loadAll();
-  renderLibrary();
-  renderTimetable();
-  renderPlanPage();
-  renderSharePage();
+  document.getElementById('auth-screen').style.display='none';
+  document.getElementById('app').style.display='flex';
+  document.getElementById('app').style.flexDirection='column';
+  document.getElementById('user-badge').textContent=currentUserEmail;
+  await loadAll(); renderLibrary(); renderTimetable(); renderPlanPage(); renderSharePage();
+}
+
+// Safely parse a value that might be a JSON string or already an object
+function safeParse(val, fallback) {
+  if (!val) return fallback;
+  if (typeof val === 'object') return val;
+  try { return JSON.parse(val); } catch(e) { return fallback; }
 }
 
 async function loadAll() {
   try {
-    const [dishes, configs, plans] = await Promise.all([
-      db(`meal_library?user_id=eq.${currentUserId}&order=created_at.asc`),
-      db(`meal_weekly_config?user_id=eq.${currentUserId}&order=created_at.desc&limit=1`),
-      db(`meal_plans?user_id=eq.${currentUserId}&order=created_at.desc`)
+    const [dishes,configs,plans] = await Promise.all([
+      db(`meal_library?select=*&user_id=eq.${currentUserId}&order=created_at.asc`),
+      db(`meal_weekly_config?select=*&user_id=eq.${currentUserId}&order=created_at.desc&limit=1`),
+      db(`meal_plans?select=*&user_id=eq.${currentUserId}&order=created_at.desc`)
     ]);
-    state.dishes = dishes || [];
-    state.savedPlans = plans || [];
+    state.dishes = dishes||[];
+
+    // Defensively parse plan/config fields — Supabase can return JSON columns
+    // as strings in some configurations, which silently breaks all dependent logic
     if (configs?.length) {
-      state.weekConfig = configs[0].config || defaultConfig();
-      state.preferences = configs[0].preferences || defaultPrefs();
+      state.weekConfig = safeParse(configs[0].config, defaultConfig());
+      const raw = safeParse(configs[0].preferences, {});
+      state.preferences = (raw.lunch && raw.dinner) ? raw : defaultPrefs();
     }
-  } catch (e) { toast('Load error: ' + e.message, 'error'); }
+
+    const parsedPlans = (plans||[]).map(p => ({
+      ...p,
+      plan: safeParse(p.plan, {})
+    }));
+    state.savedPlans = parsedPlans;
+    if (parsedPlans.length) state.mealPlan = parsedPlans[0].plan || {};
+
+  } catch(e) {
+    console.error('loadAll error:', e);
+    toast('Load error: '+e.message,'error');
+    // Dead token — force re-login rather than staying stuck on empty UI
+    if (e.message && /JWT|401|expired|invalid/i.test(e.message)) {
+      setTimeout(() => handleLogout(), 2000);
+    }
+  }
 }
 
 function navigate(page) {
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   document.getElementById(`page-${page}`).classList.add('active');
   document.querySelector(`[data-page="${page}"]`).classList.add('active');
-  if (page === 'plan') renderPlanPage();
-  if (page === 'share') renderSharePage();
+  if (page==='plan') renderPlanPage();
+  if (page==='share') renderSharePage();
 }
 
-// --- DISH LIBRARY ---
+// ── DISH LIBRARY ──
 function renderLibrary() {
   const wrap = document.getElementById('dish-table-wrap');
   if (!state.dishes.length) {
-    wrap.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🍳</div><div class="empty-state-title">Your library is empty</div><p class="empty-state-text">Add dishes to build your collection.</p><button class="btn btn-primary" onclick="openDishModal()">Add your first dish</button></div>`;
+    wrap.innerHTML=`<div class="empty-state"><div class="empty-state-icon">🍳</div><div class="empty-state-title">Your library is empty</div><p class="empty-state-text">Add dishes to build your personal collection.</p><button class="btn btn-primary" onclick="openDishModal()">Add your first dish</button></div>`;
     return;
   }
-  wrap.innerHTML = `<table class="dish-table">
+  wrap.innerHTML=`<table class="dish-table">
     <thead><tr><th style="width:38px"></th><th>Dish</th><th>Type</th><th>Ingredients</th><th>Remarks</th><th style="width:88px"></th></tr></thead>
-    <tbody>${state.dishes.map(d => `<tr>
-      <td>${d.image_url ? `<img class="dish-thumb" src="${d.image_url}">` : `<div class="dish-thumb-placeholder">${EMOJI[d.meal_type] || '🍽'}</div>`}</td>
+    <tbody>${state.dishes.map(d=>`<tr>
+      <td>${d.image_url?`<img class="dish-thumb" src="${esc(d.image_url)}">`:`<div class="dish-thumb-placeholder">${EMOJI[d.meal_type]||'🍽'}</div>`}</td>
       <td class="dish-name-cell">${esc(d.meal_name)}</td>
       <td><span class="type-badge ${typeClass(d.meal_type)}">${EMOJI[d.meal_type]} ${d.meal_type}</span></td>
-      <td><div class="ing-chips">${(d.ingredients || []).slice(0, 3).map(i => `<span class="ing-chip">${esc(i)}</span>`).join('')}${(d.ingredients || []).length > 3 ? `<span class="ing-chip">+${(d.ingredients || []).length - 3}</span>` : ''}</div></td>
-      <td class="dish-remarks-cell">${esc(d.remarks || '—')}</td>
+      <td><div class="ing-chips">${(d.ingredients||[]).slice(0,3).map(i=>`<span class="ing-chip">${esc(i)}</span>`).join('')}${(d.ingredients||[]).length>3?`<span class="ing-chip">+${(d.ingredients||[]).length-3}</span>`:''}</div></td>
+      <td class="dish-remarks-cell" title="${esc(d.remarks||'')}">${esc(d.remarks||'—')}</td>
       <td><div class="row-actions"><button class="btn btn-secondary btn-xs" onclick="openDishModal('${d.id}')">Edit</button><button class="btn btn-danger btn-xs" onclick="deleteDish('${d.id}')">Del</button></div></td>
     </tr>`).join('')}</tbody>
   </table>`;
 }
 
 function openDishModal(id) {
-  state.editingDishId = id || null; state.pendingImageFile = null;
-  const dish = id ? state.dishes.find(d => d.id === id) : null;
-  document.getElementById('dish-modal-title').textContent = dish ? 'Edit dish' : 'Add dish';
-  document.getElementById('field-dish-name').value = dish?.meal_name || '';
-  document.getElementById('field-dish-type').value = dish?.meal_type || 'protein';
-  document.getElementById('field-dish-remarks').value = dish?.remarks || '';
-  const prev = document.getElementById('image-preview'), hint = document.getElementById('upload-hint');
-  if (dish?.image_url) { prev.src = dish.image_url; prev.style.display = 'block'; hint.style.display = 'none'; }
-  else { prev.style.display = 'none'; hint.style.display = 'block'; }
-  const editor = document.getElementById('ingredient-editor');
-  const ings = dish?.ingredients?.length ? dish.ingredients : [''];
-  editor.innerHTML = ings.map(i => ingRowHtml(i)).join('');
+  state.editingDishId=id||null; state.pendingImageFile=null;
+  const dish=id?state.dishes.find(d=>d.id===id):null;
+  document.getElementById('dish-modal-title').textContent=dish?'Edit dish':'Add dish';
+  document.getElementById('field-dish-name').value=dish?.meal_name||'';
+  document.getElementById('field-dish-type').value=dish?.meal_type||'protein';
+  document.getElementById('field-dish-remarks').value=dish?.remarks||'';
+  document.getElementById('field-dish-image').value='';
+  const prev=document.getElementById('image-preview'), hint=document.getElementById('upload-hint');
+  if (dish?.image_url) { prev.src=dish.image_url; prev.style.display='block'; hint.style.display='none'; }
+  else { prev.style.display='none'; hint.style.display='block'; }
+  const editor=document.getElementById('ingredient-editor');
+  const ings=dish?.ingredients?.length?dish.ingredients:[''];
+  editor.innerHTML=ings.map(i=>ingRowHtml(i)).join('');
   document.getElementById('dish-modal').classList.add('open');
+  document.getElementById('field-dish-name').focus();
 }
 
-function ingRowHtml(val = '') {
-  return `<div class="ingredient-row"><input type="text" class="form-input" value="${esc(val)}" placeholder="e.g. garlic"><button class="btn-remove-ing" onclick="this.parentElement.remove()">×</button></div>`;
-}
-
-function addIngredientRow() {
-  const e = document.getElementById('ingredient-editor');
-  const d = document.createElement('div');
-  d.innerHTML = ingRowHtml();
-  e.appendChild(d.firstChild);
-}
-
+function ingRowHtml(val='') { return `<div class="ingredient-row"><input type="text" class="form-input" value="${esc(val)}" placeholder="e.g. chicken breast"><button class="btn-remove-ing" onclick="this.parentElement.remove()">×</button></div>`; }
+function addIngredientRow() { const e=document.getElementById('ingredient-editor'); const d=document.createElement('div'); d.innerHTML=ingRowHtml(); e.appendChild(d.firstChild); e.lastElementChild?.querySelector('input')?.focus(); }
 function closeDishModal() { document.getElementById('dish-modal').classList.remove('open'); }
 
 function handleImageSelect(e) {
-  const file = e.target.files[0]; if (!file) return;
-  state.pendingImageFile = file;
-  compressImage(file).then(b64 => {
-    const p = document.getElementById('image-preview');
-    p.src = b64; p.style.display = 'block';
-    document.getElementById('upload-hint').style.display = 'none';
-  });
+  const file=e.target.files[0]; if(!file)return;
+  state.pendingImageFile=file;
+  compressImage(file).then(b64=>{ const p=document.getElementById('image-preview'); p.src=b64; p.style.display='block'; document.getElementById('upload-hint').style.display='none'; });
 }
 
 async function saveDish() {
-  const name = document.getElementById('field-dish-name').value.trim();
-  const type = document.getElementById('field-dish-type').value;
-  const remarks = document.getElementById('field-dish-remarks').value.trim();
-  const ings = [...document.querySelectorAll('#ingredient-editor input')].map(i => i.value.trim()).filter(Boolean);
-  if (!name) { toast('Enter a dish name', 'error'); return; }
-  
-  const btn = document.getElementById('save-dish-btn');
-  btn.disabled = true; btn.innerHTML = '<span class="loading-spinner"></span>';
-  
+  const name=document.getElementById('field-dish-name').value.trim();
+  const type=document.getElementById('field-dish-type').value;
+  const remarks=document.getElementById('field-dish-remarks').value.trim();
+  const ings=[...document.querySelectorAll('#ingredient-editor input')].map(i=>i.value.trim()).filter(Boolean);
+  if (!name) { toast('Please enter a dish name.','error'); return; }
+  const btn=document.getElementById('save-dish-btn'); btn.disabled=true; btn.innerHTML='<span class="loading-spinner"></span>';
   try {
-    let imageUrl = state.editingDishId ? state.dishes.find(d => d.id === state.editingDishId)?.image_url : null;
-    if (state.pendingImageFile) imageUrl = await compressImage(state.pendingImageFile);
-
-    const payload = { meal_name: name, meal_type: type, ingredients: ings, remarks, image_url: imageUrl, user_id: currentUserId, updated_at: new Date().toISOString() };
-    
+    let imageUrl = state.editingDishId ? state.dishes.find(d=>d.id===state.editingDishId)?.image_url : null;
+    if (state.pendingImageFile) {
+      // Compress: max 200px, 60% quality
+      imageUrl = await compressImage(state.pendingImageFile, 200, 0.6);
+    }
+    const payload={meal_name:name,meal_type:type,ingredients:ings,remarks,image_url:imageUrl,user_id:currentUserId,updated_at:new Date().toISOString()};
     if (state.editingDishId) {
-      const res = await db(`meal_library?id=eq.${state.editingDishId}&user_id=eq.${currentUserId}`, { method: 'PATCH', body: JSON.stringify(payload) });
-      const updated = Array.isArray(res) ? res[0] : res;
-      state.dishes = state.dishes.map(d => d.id === state.editingDishId ? updated : d);
-      toast('Updated!', 'success');
+      const [u]=await db(`meal_library?id=eq.${state.editingDishId}&user_id=eq.${currentUserId}`,{method:'PATCH',body:JSON.stringify(payload)});
+      state.dishes=state.dishes.map(d=>d.id===state.editingDishId?u:d); toast('Dish updated!','success');
     } else {
-      const res = await db(`meal_library`, { method: 'POST', body: JSON.stringify(payload) });
-      const created = Array.isArray(res) ? res[0] : res;
-      state.dishes.push(created);
-      toast('Added!', 'success');
+      const [c]=await db(`meal_library`,{method:'POST',body:JSON.stringify(payload)});
+      state.dishes.push(c); toast('Dish added!','success');
     }
     closeDishModal(); renderLibrary();
-  } catch (e) { toast(e.message, 'error'); }
-  btn.disabled = false; btn.innerHTML = 'Save dish';
+  } catch(e) { toast('Error: '+e.message,'error'); }
+  btn.disabled=false; btn.innerHTML='Save dish';
 }
 
 async function deleteDish(id) {
   if (!confirm('Delete this dish?')) return;
   try {
-    await db(`meal_library?id=eq.${id}&user_id=eq.${currentUserId}`, { method: 'DELETE', prefer: '' });
-    state.dishes = state.dishes.filter(d => d.id !== id);
-    renderLibrary(); toast('Deleted', 'success');
-  } catch (e) { toast(e.message, 'error'); }
+    await db(`meal_library?id=eq.${id}&user_id=eq.${currentUserId}`,{method:'DELETE',prefer:''});
+    state.dishes=state.dishes.filter(d=>d.id!==id);
+    Object.keys(state.mealPlan).forEach(k=>{ state.mealPlan[k]=(state.mealPlan[k]||[]).filter(did=>did!==id); });
+    renderLibrary(); toast('Dish deleted.','success');
+  } catch(e) { toast('Error: '+e.message,'error'); }
 }
 
-// --- TIMETABLE ---
-function changeWeek(dir) { state.weekOffset += dir; renderTimetable(); }
+// ── TIMETABLE ──
+function changeWeek(dir) { state.weekOffset+=dir; renderTimetable(); }
 function renderTimetable() {
-  document.getElementById('week-display').textContent = getWeekLabel(state.weekOffset);
-  let html = `<div class="wg-cell wg-header"></div>`;
-  DAYS.forEach(d => html += `<div class="wg-cell wg-header">${d.slice(0, 3)}</div>`);
-  MTIMES.forEach(mt => {
-    html += `<div class="wg-cell wg-row-label">${mt === 'lunch' ? '☀️ Lunch' : '🌙 Dinner'}</div>`;
-    DAYS.forEach(d => {
-      const on = state.weekConfig[d]?.[mt] || false;
-      html += `<div class="wg-cell" style="text-align:center"><button class="week-toggle ${on ? 'on' : ''}" onclick="toggleSlot('${d}','${mt}',this)"></button></div>`;
-    });
+  document.getElementById('week-display').textContent=getWeekLabel(state.weekOffset);
+  let html=`<div class="wg-cell wg-header"></div>`;
+  DAYS.forEach(d=>html+=`<div class="wg-cell wg-header">${d.slice(0,3)}</div>`);
+  MTIMES.forEach(mt=>{
+    html+=`<div class="wg-cell wg-row-label">${mt==='lunch'?'☀️ Lunch':'🌙 Dinner'}</div>`;
+    DAYS.forEach(d=>{ const on=state.weekConfig[d]?.[mt]||false; html+=`<div class="wg-cell" style="text-align:center"><button class="week-toggle ${on?'on':''}" onclick="toggleSlot('${d}','${mt}',this)"></button></div>`; });
   });
-  document.getElementById('week-grid').innerHTML = html;
+  document.getElementById('week-grid').innerHTML=html;
   renderPrefs();
 }
-
-function toggleSlot(day, mt, btn) {
-  if (!state.weekConfig[day]) state.weekConfig[day] = {};
-  state.weekConfig[day][mt] = !state.weekConfig[day][mt];
-  btn.classList.toggle('on', state.weekConfig[day][mt]);
-}
-
+function toggleSlot(day,mt,btn) { if(!state.weekConfig[day])state.weekConfig[day]={}; state.weekConfig[day][mt]=!state.weekConfig[day][mt]; btn.classList.toggle('on',state.weekConfig[day][mt]); }
 function renderPrefs() {
-  document.getElementById('prefs-grid').innerHTML = MTIMES.map(mt => `<div>
-    <div class="pref-meal-label">${mt === 'lunch' ? '☀️ Lunch' : '🌙 Dinner'}</div>
-    ${TYPES.map(t => `<div class="pref-type-item"><span class="pref-type-label">${EMOJI[t]} ${t}</span>
-      <div class="number-input">
-        <button class="number-btn" onclick="adjustPref('${mt}','${t}',-1)">−</button>
-        <div class="number-val" id="pref-${mt}-${t}">${state.preferences[mt]?.[t] ?? 0}</div>
-        <button class="number-btn" onclick="adjustPref('${mt}','${t}',1)">+</button>
-      </div>
+  document.getElementById('prefs-grid').innerHTML=MTIMES.map(mt=>`<div>
+    <div class="pref-meal-label">${mt==='lunch'?'☀️ Lunch':'🌙 Dinner'}</div>
+    ${TYPES.map(t=>`<div class="pref-type-item"><span class="pref-type-label">${EMOJI[t]} ${t}</span>
+      <div class="number-input"><button class="number-btn" onclick="adjustPref('${mt}','${t}',-1)">−</button><div class="number-val" id="pref-${mt}-${t}">${state.preferences[mt]?.[t]??0}</div><button class="number-btn" onclick="adjustPref('${mt}','${t}',1)">+</button></div>
     </div>`).join('')}
   </div>`).join('');
 }
-
-function adjustPref(mt, type, delta) {
-  if (!state.preferences[mt]) state.preferences[mt] = {};
-  state.preferences[mt][type] = Math.max(0, (state.preferences[mt][type] || 0) + delta);
-  document.getElementById(`pref-${mt}-${type}`).textContent = state.preferences[mt][type];
-}
-
+function adjustPref(mt,type,delta) { if(!state.preferences[mt])state.preferences[mt]={}; state.preferences[mt][type]=Math.max(0,(state.preferences[mt][type]||0)+delta); const el=document.getElementById(`pref-${mt}-${type}`); if(el)el.textContent=state.preferences[mt][type]; }
 async function saveWeeklyConfig() {
   try {
-    const wl = getWeekLabel(state.weekOffset);
-    const existing = await db(`meal_weekly_config?user_id=eq.${currentUserId}&week_label=eq.${encodeURIComponent(wl)}`);
-    const payload = { user_id: currentUserId, week_label: wl, config: state.weekConfig, preferences: state.preferences, updated_at: new Date().toISOString() };
-    if (existing?.length) await db(`meal_weekly_config?id=eq.${existing[0].id}`, { method: 'PATCH', body: JSON.stringify(payload) });
-    else await db(`meal_weekly_config`, { method: 'POST', body: JSON.stringify(payload) });
-    toast('Saved!', 'success');
-  } catch (e) { toast(e.message, 'error'); }
+    const wl=getWeekLabel(state.weekOffset);
+    const existing=await db(`meal_weekly_config?user_id=eq.${currentUserId}&week_label=eq.${encodeURIComponent(wl)}`);
+    const payload={user_id:currentUserId,week_label:wl,config:state.weekConfig,preferences:state.preferences,updated_at:new Date().toISOString()};
+    if (existing?.length) await db(`meal_weekly_config?id=eq.${existing[0].id}&user_id=eq.${currentUserId}`,{method:'PATCH',body:JSON.stringify(payload)});
+    else await db(`meal_weekly_config`,{method:'POST',body:JSON.stringify(payload)});
+    toast('Timetable saved!','success');
+  } catch(e) { toast('Error: '+e.message,'error'); }
 }
 
-// --- PLAN MEALS ---
+// ── PLAN MEALS ──
 function renderPlanPage() {
-  const container = document.getElementById('plan-days');
-  const hasAny = DAYS.some(d => state.weekConfig[d]?.lunch || state.weekConfig[d]?.dinner);
-  if (!hasAny) {
-    container.innerHTML = `<div class="empty-state"><div class="empty-state-icon">📅</div><div class="empty-state-title">No meals planned</div><p class="empty-state-text">Set up your timetable first.</p></div>`;
-    return;
-  }
-  container.innerHTML = '';
-  DAYS.forEach(d => {
-    const lOn = state.weekConfig[d]?.lunch, dOn = state.weekConfig[d]?.dinner;
-    if (!lOn && !dOn) return;
-    const div = document.createElement('div'); div.className = 'plan-day';
-    div.innerHTML = `<div class="plan-day-header"><div class="plan-day-name">${d}</div></div><div class="plan-meals-row">${buildSlotHtml(d, 'lunch', lOn)}${buildSlotHtml(d, 'dinner', dOn)}</div>`;
+  const container=document.getElementById('plan-days'); container.innerHTML='';
+  const hasAny=DAYS.some(d=>state.weekConfig[d]?.lunch||state.weekConfig[d]?.dinner);
+  if (!hasAny) { container.innerHTML=`<div class="empty-state"><div class="empty-state-icon">📅</div><div class="empty-state-title">No meals configured</div><p class="empty-state-text">Set up your weekly timetable first.</p><button class="btn btn-secondary" onclick="navigate('timetable')">Go to timetable</button></div>`; updateNutritionSummary(); return; }
+  if (!state.dishes.length) { container.innerHTML=`<div class="empty-state"><div class="empty-state-icon">📚</div><div class="empty-state-title">No dishes in library</div><p class="empty-state-text">Add dishes to your library first.</p><button class="btn btn-secondary" onclick="navigate('library')">Go to library</button></div>`; return; }
+  DAYS.forEach(d=>{
+    const lOn=state.weekConfig[d]?.lunch, dOn=state.weekConfig[d]?.dinner;
+    if (!lOn&&!dOn) return;
+    const div=document.createElement('div'); div.className='plan-day';
+    div.innerHTML=`<div class="plan-day-header"><div class="plan-day-name">${d}</div></div><div class="plan-meals-row">${buildSlotHtml(d,'lunch',lOn)}${buildSlotHtml(d,'dinner',dOn)}</div>`;
     container.appendChild(div);
   });
   updateNutritionSummary();
 }
 
-function buildSlotHtml(day, mt, enabled) {
-  const key = `${day}-${mt}`;
-  if (!enabled) return `<div class="plan-meal-slot slot-disabled"><div class="plan-slot-label">${mt}</div><span class="slot-disabled-msg">off</span></div>`;
-  const ids = state.mealPlan[key] || [];
-  const chips = ids.map(id => {
-    const d = state.dishes.find(x => x.id === id); if (!d) return '';
-    return `<span class="dish-chip">${d.image_url ? `<img class="dish-chip-img" src="${d.image_url}">` : `<div class="dish-chip-placeholder">${EMOJI[d.meal_type]}</div>`}${esc(d.meal_name)}<button class="dish-chip-remove" onclick="removeDish('${day}','${mt}','${id}')">×</button></span>`;
+function buildSlotHtml(day,mt,enabled) {
+  const key=`${day}-${mt}`;
+  if (!enabled) return `<div class="plan-meal-slot slot-disabled"><div class="plan-slot-label">${mt==='lunch'?'☀️ Lunch':'🌙 Dinner'}</div><span class="slot-disabled-msg">not planned</span></div>`;
+  const ids=state.mealPlan[key]||[];
+  const chips=ids.map(id=>{
+    const d=state.dishes.find(x=>x.id===id); if(!d)return '';
+    const imgHtml = d.image_url
+      ? `<img class="dish-chip-img" src="${esc(d.image_url)}" alt="">`
+      : `<div class="dish-chip-placeholder">${EMOJI[d.meal_type]}</div>`;
+    return `<span class="dish-chip">${imgHtml}${esc(d.meal_name)}<button class="dish-chip-remove" onclick="removeDish('${day}','${mt}','${id}')">×</button></span>`;
   }).join('');
-  const opts = state.dishes.filter(d => !ids.includes(d.id)).map(d => `<option value="${d.id}">${EMOJI[d.meal_type]} ${d.meal_name}</option>`).join('');
+  const used=new Set(ids);
+  const avail=state.dishes.filter(d=>!used.has(d.id));
+  const opts=avail.map(d=>`<option value="${d.id}">${EMOJI[d.meal_type]} ${d.meal_name}</option>`).join('');
   return `<div class="plan-meal-slot">
-    <div class="plan-slot-label">${mt}</div>
-    <div class="dish-chips-row">${chips}</div>
-    <select class="dish-add-select" onchange="addDish('${day}','${mt}',this)"><option value="">+ Add dish</option>${opts}</select>
+    <div class="plan-slot-label">${mt==='lunch'?'☀️ Lunch':'🌙 Dinner'}</div>
+    <div class="dish-chips-row">${chips||'<span style="font-size:11px;color:var(--ink-muted);font-style:italic">No dishes yet</span>'}</div>
+    ${avail.length?`<select class="dish-add-select" onchange="addDish('${day}','${mt}',this)"><option value="">+ Add a dish…</option>${opts}</select>`:`<span style="font-size:11px;font-family:'DM Mono',monospace;color:var(--ink-muted)">All dishes added</span>`}
   </div>`;
 }
-
-function addDish(day, mt, sel) {
-  const id = sel.value; if (!id) return;
-  const key = `${day}-${mt}`;
-  if (!state.mealPlan[key]) state.mealPlan[key] = [];
-  state.mealPlan[key].push(id);
-  renderPlanPage();
-}
-
-function removeDish(day, mt, id) {
-  const key = `${day}-${mt}`;
-  state.mealPlan[key] = state.mealPlan[key].filter(x => x !== id);
-  renderPlanPage();
-}
+function addDish(day,mt,sel) { const id=sel.value; if(!id)return; const key=`${day}-${mt}`; if(!state.mealPlan[key])state.mealPlan[key]=[]; if(!state.mealPlan[key].includes(id))state.mealPlan[key].push(id); sel.value=''; renderPlanPage(); }
+function removeDish(day,mt,dishId) { const key=`${day}-${mt}`; state.mealPlan[key]=(state.mealPlan[key]||[]).filter(id=>id!==dishId); renderPlanPage(); }
 
 function updateNutritionSummary() {
-  const counts = { protein: 0, vegetable: 0, carbs: 0, soup: 0, 'small dishes': 0 };
-  Object.values(state.mealPlan).forEach(ids => ids.forEach(id => { const d = state.dishes.find(x => x.id === id); if (d) counts[d.meal_type]++; }));
-  document.getElementById('nutrition-summary').innerHTML = TYPES.map(t => `<div class="nutrition-chip chip-${t.replace(/\s+/g, '-')}"><span class="count">${counts[t]}</span> ${EMOJI[t]}</div>`).join('');
+  const counts={protein:0,vegetable:0,carbs:0,soup:0};
+  Object.values(state.mealPlan).forEach(ids=>(ids||[]).forEach(id=>{ const d=state.dishes.find(x=>x.id===id); if(d)counts[d.meal_type]++; }));
+  const warnings=[];
+  DAYS.forEach(d=>{ MTIMES.forEach(mt=>{ if(!state.weekConfig[d]?.[mt])return; const key=`${d}-${mt}`, ids=state.mealPlan[key]||[], sc={protein:0,vegetable:0,carbs:0,soup:0};
+    ids.forEach(id=>{ const dish=state.dishes.find(x=>x.id===id); if(dish)sc[dish.meal_type]++; });
+    TYPES.forEach(t=>{ const tgt=state.preferences[mt]?.[t]||0; if(tgt>0&&sc[t]<tgt)warnings.push(`${d} ${mt}: ${tgt-sc[t]} more ${EMOJI[t]}`); });
+  }); });
+  const wEl=document.getElementById('nutrition-warning');
+  if (warnings.length) { wEl.style.display='block'; wEl.textContent='⚠️ '+warnings.slice(0,4).join(' · ')+(warnings.length>4?` +${warnings.length-4} more`:''); }
+  else { wEl.style.display='none'; }
+  const total=Object.values(counts).reduce((a,b)=>a+b,0);
+  document.getElementById('nutrition-summary').innerHTML=TYPES.map(t=>`<div class="nutrition-chip chip-${t.replace(/\s+/g,'-')}"><span class="count">${counts[t]}</span>${EMOJI[t]} ${t}</div>`).join('')+`<div style="flex:1"></div><div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--ink-muted);align-self:center">${total} dishes total</div>`;
+}
+
+function autoFillPlan() {
+  if (!state.dishes.length) { toast('Add dishes to your library first.','error'); return; }
+  const hasAnySlot = DAYS.some(d => state.weekConfig[d]?.lunch || state.weekConfig[d]?.dinner);
+  if (!hasAnySlot) { toast('Enable some meal slots in the Weekly Timetable first.','error'); return; }
+
+  // ── Build penalty sets ──
+  // 1. Dishes used in the PREVIOUS week's saved plan (high penalty)
+  const prevWeekLabel = getWeekLabel(state.weekOffset - 1);
+  const prevPlan = state.savedPlans.find(p => p.week_label === prevWeekLabel);
+  const prevWeekIds = new Set();
+  if (prevPlan) {
+    Object.values(prevPlan.plan || {}).forEach(ids => (ids||[]).forEach(id => prevWeekIds.add(id)));
+  }
+
+  // 2. Dishes already chosen earlier in THIS fill pass (tracked live)
+  const thisWeekUsageCount = {};
+
+  // 3. Track which dish IDs appear in each day slot so we can penalise same-day and previous-day reuse
+  // priorIds(day) returns dish IDs already used today (other meal slot) + all of yesterday
+  const planByDay = {}; // { 'Monday': Set<dishId>, ... }
+  function priorIds(day) {
+    const idx = DAYS.indexOf(day);
+    const ids = new Set();
+    // Same day (e.g. lunch already picked when scoring dinner)
+    (planByDay[day] || new Set()).forEach(id => ids.add(id));
+    // Day before
+    if (idx > 0) (planByDay[DAYS[idx - 1]] || new Set()).forEach(id => ids.add(id));
+    return ids;
+  }
+
+  // Scoring: lower = more preferred
+  // +5  if used in previous week's saved plan
+  // +15 per use already this week (first repeat = +15, second = +30, etc.)
+  // +30 if used in the same day (other meal slot) or the day before
+  // +0–7 random jitter
+  function dishScore(dishId, priorIdSet) {
+    const prevPenalty    = prevWeekIds.has(dishId) ? 5 : 0;
+    const repeatPenalty  = (thisWeekUsageCount[dishId] || 0) * 15;
+    const proximityPenalty = priorIdSet.has(dishId) ? 30 : 0;
+    const jitter         = Math.random() * 7;
+    return prevPenalty + repeatPenalty + proximityPenalty + jitter;
+  }
+
+  const plan = {};
+
+  // Process slots in a fixed order (Mon–Sun, lunch then dinner)
+  DAYS.forEach(d => {
+    MTIMES.forEach(mt => {
+      if (!state.weekConfig[d]?.[mt]) return;
+      const key = `${d}-${mt}`;
+      const prefs = state.preferences[mt] || {};
+      const sel = [];
+      const adjIds = priorIds(d);
+
+      TYPES.forEach(t => {
+        const cnt = prefs[t] || 0;
+        if (!cnt) return;
+
+        // Candidates of this type, sorted by score ascending
+        const candidates = state.dishes
+          .filter(x => x.meal_type === t && !sel.includes(x.id))
+          .map(x => ({ id: x.id, score: dishScore(x.id, adjIds) }))
+          .sort((a, b) => a.score - b.score);
+
+        // Pick the top `cnt` candidates
+        candidates.slice(0, cnt).forEach(c => {
+          sel.push(c.id);
+          thisWeekUsageCount[c.id] = (thisWeekUsageCount[c.id] || 0) + 1;
+          // Record in planByDay so the next day can check adjacency
+          if (!planByDay[d]) planByDay[d] = new Set();
+          planByDay[d].add(c.id);
+        });
+      });
+
+      plan[key] = sel;
+    });
+  });
+
+  state.mealPlan = plan;
+  renderPlanPage();
+
+  // Summarise what we avoided
+  const avoidedPrev = Object.values(plan).flat().filter(id => prevWeekIds.has(id)).length;
+  const msg = prevPlan && avoidedPrev === 0
+    ? 'Auto-filled! No repeats from last week. ✓'
+    : prevPlan && avoidedPrev > 0
+      ? `Auto-filled — ${avoidedPrev} dish${avoidedPrev>1?'es':''} repeated from last week (library too small to fully avoid).`
+      : 'Plan auto-filled with minimal repetition!';
+  toast(msg, 'success');
 }
 
 async function saveMealPlan() {
   try {
-    const wl = getWeekLabel(state.weekOffset);
-    const payload = { user_id: currentUserId, week_label: wl, plan: state.mealPlan, updated_at: new Date().toISOString() };
-    const existing = await db(`meal_plans?user_id=eq.${currentUserId}&week_label=eq.${encodeURIComponent(wl)}`);
-    if (existing?.length) await db(`meal_plans?id=eq.${existing[0].id}`, { method: 'PATCH', body: JSON.stringify(payload) });
-    else await db(`meal_plans`, { method: 'POST', body: JSON.stringify(payload) });
-    toast('Plan saved!', 'success');
-  } catch (e) { toast(e.message, 'error'); }
+    const wl=getWeekLabel(state.weekOffset);
+    const existing=await db(`meal_plans?select=*&user_id=eq.${currentUserId}&week_label=eq.${encodeURIComponent(wl)}`);
+    const payload={user_id:currentUserId,week_label:wl,plan:state.mealPlan,updated_at:new Date().toISOString()};
+    let saved;
+    if (existing?.length) { [saved]=await db(`meal_plans?id=eq.${existing[0].id}&user_id=eq.${currentUserId}`,{method:'PATCH',body:JSON.stringify(payload)}); }
+    else { [saved]=await db(`meal_plans`,{method:'POST',body:JSON.stringify(payload)}); }
+    // Ensure plan field is always a proper object, not a JSON string
+    saved = {...saved, plan: safeParse(saved.plan, {})};
+    if (existing?.length) { state.savedPlans=state.savedPlans.map(p=>p.id===saved.id?saved:p); }
+    else { state.savedPlans.unshift(saved); }
+    toast('Meal plan saved!','success');
+    renderSharePage();
+  } catch(e) { toast('Error: '+e.message,'error'); }
 }
 
-// --- SHARE PAGE ---
+// ── SHARE ──
+
+// Collect all ingredients for a given day across both meal times
+function getDayIngredients(plan, day) {
+  const all = new Set();
+  MTIMES.forEach(mt => {
+    const ids = plan[`${day}-${mt}`] || [];
+    ids.forEach(id => {
+      const dish = state.dishes.find(x => x.id === id);
+      (dish?.ingredients || []).forEach(i => all.add(i));
+    });
+  });
+  return [...all];
+}
+
 function renderSharePage() {
   const listEl = document.getElementById('saved-plans-list');
-  if (!state.savedPlans.length) { listEl.innerHTML = `<div class="empty-state">No saved plans</div>`; return; }
-  listEl.innerHTML = state.savedPlans.map(p => `<div class="saved-plan-item" onclick="selectPlan('${p.id}')"><div>${p.week_label}</div></div>`).join('');
+  if (!state.savedPlans.length) {
+    listEl.innerHTML=`<div class="empty-state"><div class="empty-state-icon">📋</div><div class="empty-state-title">No saved plans yet</div><p class="empty-state-text">Save a meal plan to view it here.</p></div>`;
+    document.getElementById('share-content').innerHTML=''; return;
+  }
+  listEl.innerHTML = state.savedPlans.map(p => `
+    <div class="saved-plan-item ${state.selectedPlanId===p.id?'selected':''}" onclick="selectPlan('${p.id}')">
+      <div>
+        <div class="saved-plan-week">${p.week_label}</div>
+        <div class="saved-plan-date">Saved ${new Date(p.updated_at||p.created_at).toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'})}</div>
+      </div>
+      <div class="saved-plan-item-actions">
+        <button class="btn btn-danger btn-xs" onclick="deletePlan(event,'${p.id}')">Delete</button>
+        <span style="color:var(--ink-muted)">→</span>
+      </div>
+    </div>`).join('');
+  if (!state.selectedPlanId && state.savedPlans.length) state.selectedPlanId = state.savedPlans[0].id;
+  if (state.selectedPlanId) renderShareCard(state.selectedPlanId);
 }
 
-function selectPlan(id) { state.selectedPlanId = id; renderShareCard(id); }
+function selectPlan(id) { state.selectedPlanId=id; renderSharePage(); }
 
-function renderShareCard(id) {
-  const plan = state.savedPlans.find(p => p.id === id); if (!plan) return;
-  document.getElementById('share-content').innerHTML = `<div class="share-card"><h3>${plan.week_label}</h3><p>Copy or export options go here.</p></div>`;
+async function deletePlan(e, id) {
+  e.stopPropagation();
+  if (!confirm('Delete this saved plan?')) return;
+  try {
+    await db(`meal_plans?id=eq.${id}&user_id=eq.${currentUserId}`, {method:'DELETE', prefer:''});
+    state.savedPlans = state.savedPlans.filter(p => p.id !== id);
+    if (state.selectedPlanId === id) state.selectedPlanId = state.savedPlans[0]?.id || null;
+    toast('Plan deleted.','success');
+    renderSharePage();
+  } catch(e) { toast('Error: '+e.message,'error'); }
 }
 
-// --- INIT ---
-(async function init() {
+function renderShareCard(planId) {
+  const plan = state.savedPlans.find(p=>p.id===planId); if(!plan)return;
+  // Ensure plan.plan is always a proper object (not a JSON string)
+  if (typeof plan.plan !== 'object' || plan.plan === null) {
+    plan.plan = safeParse(plan.plan, {});
+  }
+
+  // Build meal plan card HTML
+  let mealDaysHtml = '';
+  DAYS.forEach(d => {
+    const lIds = plan.plan[`${d}-lunch`]||[], dIds = plan.plan[`${d}-dinner`]||[];
+    if (!lIds.length && !dIds.length) return;
+    const slotHtml = (ids, label) => {
+      if (!ids.length) return '';
+      const tiles = ids.map(id => {
+        const dish = state.dishes.find(x=>x.id===id); if(!dish)return '';
+        return `<div class="share-dish-tile">
+          ${dish.image_url
+            ? `<img class="share-dish-tile-img" src="${esc(dish.image_url)}" alt="${esc(dish.meal_name)}">`
+            : `<div class="share-dish-tile-placeholder">${EMOJI[dish.meal_type]}</div>`}
+          <span class="share-dish-tile-name">${esc(dish.meal_name)}</span>
+        </div>`;
+      }).join('');
+      return `<div class="share-slot"><div class="share-slot-label">${label}</div><div class="share-dish-row">${tiles}</div></div>`;
+    };
+    mealDaysHtml += `<div class="share-day-block"><div class="share-day-name">${d}</div>${slotHtml(lIds,'☀️ Lunch')}${slotHtml(dIds,'🌙 Dinner')}</div>`;
+  });
+
+  // Build ingredient list HTML
+  let ingDaysHtml = '';
+  DAYS.forEach(d => {
+    const ings = getDayIngredients(plan.plan, d);
+    if (!ings.length) return;
+    ingDaysHtml += `<div class="ing-day-block"><div class="ing-day-name">${d}</div>${ings.map(i=>`<div class="ing-item">${esc(i)}</div>`).join('')}</div>`;
+  });
+
+  document.getElementById('share-content').innerHTML = `
+    <div class="share-card-wrap" id="share-card-wrap">
+      <div class="share-card" id="share-card-output">
+        <div class="share-card-header">
+          <div class="share-card-title">Meal Plan</div>
+          <div class="share-card-week">${plan.week_label}</div>
+        </div>
+        ${mealDaysHtml || '<div class="share-day-block"><p style="color:var(--ink-muted);font-size:13px">No dishes in this plan.</p></div>'}
+      </div>
+      <div class="share-inglist" id="share-inglist-output">
+        <div class="ing-list-header">
+          <div class="ing-list-title">Ingredients</div>
+          <div class="ing-list-week">${plan.week_label}</div>
+        </div>
+        ${ingDaysHtml || '<div class="ing-day-block"><p style="color:var(--ink-muted);font-size:13px">No ingredients.</p></div>'}
+      </div>
+    </div>
+    <div class="share-actions">
+      <button class="btn btn-primary" onclick="copyMealPlan('${planId}')">📋 Copy meal plan</button>
+      <button class="btn btn-secondary" onclick="copyIngredients('${planId}')">🛒 Copy ingredients</button>
+      <button class="btn btn-secondary" onclick="exportImage('${planId}')">🖼 Save as image</button>
+    </div>`;
+}
+
+function copyMealPlan(planId) {
+  const plan = state.savedPlans.find(p=>p.id===planId); if(!plan)return;
+  let txt = `🍽 MEAL PLAN — ${plan.week_label}\n${'─'.repeat(40)}\n\n`;
+  DAYS.forEach(d=>{
+    const lIds=plan.plan[`${d}-lunch`]||[], dIds=plan.plan[`${d}-dinner`]||[];
+    if(!lIds.length&&!dIds.length)return;
+    txt+=`${d.toUpperCase()}\n`;
+    if(lIds.length){txt+=`  ☀ Lunch:\n`; lIds.forEach(id=>{const dish=state.dishes.find(x=>x.id===id); if(dish)txt+=`    • ${dish.meal_name}\n`;});}
+    if(dIds.length){txt+=`  🌙 Dinner:\n`; dIds.forEach(id=>{const dish=state.dishes.find(x=>x.id===id); if(dish)txt+=`    • ${dish.meal_name}\n`;});}
+    txt+='\n';
+  });
+  navigator.clipboard.writeText(txt).then(()=>toast('Meal plan copied!','success')).catch(()=>prompt('Copy this:',txt));
+}
+
+function copyIngredients(planId) {
+  const plan = state.savedPlans.find(p=>p.id===planId); if(!plan)return;
+  let txt = `🛒 INGREDIENTS — ${plan.week_label}\n${'─'.repeat(40)}\n\n`;
+  DAYS.forEach(d=>{
+    const ings = getDayIngredients(plan.plan, d);
+    if(!ings.length)return;
+    txt+=`${d.toUpperCase()}\n`;
+    ings.forEach(i=>txt+=`  • ${i}\n`);
+    txt+='\n';
+  });
+  navigator.clipboard.writeText(txt).then(()=>toast('Ingredients copied!','success')).catch(()=>prompt('Copy this:',txt));
+}
+
+async function exportImage(planId) {
+  toast('Generating image…','success');
+  await loadHtml2Canvas();
+  const wrap = document.getElementById('share-card-wrap');
+  if (!wrap) return;
+  try {
+    const canvas = await html2canvas(wrap, { scale:2, backgroundColor:'#F5F0E8', useCORS:true, allowTaint:true });
+    const a = document.createElement('a');
+    a.download = `meal-plan-${planId.slice(0,6)}.png`;
+    a.href = canvas.toDataURL('image/png');
+    a.click();
+    toast('Image downloaded!','success');
+  } catch(e) { toast('Export failed: '+e.message,'error'); }
+}
+
+function loadHtml2Canvas() {
+  return new Promise(resolve => {
+    if (window.html2canvas) { resolve(); return; }
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+    s.onload = resolve;
+    document.head.appendChild(s);
+  });
+}
+
+// UTILS
+function typeClass(t) { return 'type-' + t.replace(/\s+/g, '-'); }
+function toast(msg,type='success') { const el=document.createElement('div'); el.className=`toast ${type}`; el.textContent=msg; document.getElementById('toast-container').appendChild(el); setTimeout(()=>el.remove(),3000); }
+
+(async function(){
   const saved = localStorage.getItem('mep_session');
   if (saved) {
-    const s = JSON.parse(saved);
-    authToken = s.token; currentUserId = s.userId; currentUserEmail = s.email;
-    enterApp();
-  } else {
-    document.getElementById('auth-screen').style.display = 'flex';
+    try {
+      const s = JSON.parse(saved);
+      // Validate session has required fields
+      if (!s.token || !s.userId) {
+        localStorage.removeItem('mep_session');
+        document.getElementById('auth-screen').style.display = 'flex';
+        return;
+      }
+      authToken = s.token;
+      currentUserId = s.userId;
+      currentUserEmail = s.email;
+
+      // Check if the stored JWT is expired
+      const jwt = decodeJWT(s.token);
+      const nowSec = Math.floor(Date.now() / 1000);
+      const isExpired = jwt.exp && jwt.exp < nowSec;
+
+      if (isExpired) {
+        // Token is expired — try to refresh. If refresh fails, force re-login.
+        if (s.refreshToken) {
+          const refreshed = await tryRefreshToken().catch(() => false);
+          if (!refreshed) {
+            localStorage.removeItem('mep_session');
+            document.getElementById('auth-screen').style.display = 'flex';
+            return;
+          }
+        } else {
+          // No refresh token and access token is expired — must re-login
+          localStorage.removeItem('mep_session');
+          document.getElementById('auth-screen').style.display = 'flex';
+          return;
+        }
+      } else if (s.refreshToken) {
+        // Token still valid but try a proactive refresh in the background
+        tryRefreshToken().catch(() => {});
+      }
+
+      enterApp();
+      return;
+    } catch(e) {
+      // Corrupt session — clear it
+      localStorage.removeItem('mep_session');
+    }
   }
+  document.getElementById('auth-screen').style.display = 'flex';
 })();
+
+document.addEventListener('keydown',e=>{ if(e.key==='Escape')closeDishModal(); });
+document.getElementById('dish-modal').addEventListener('click',e=>{ if(e.target===document.getElementById('dish-modal'))closeDishModal(); });
 </script>
 </body>
 </html>
