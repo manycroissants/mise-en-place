@@ -94,6 +94,7 @@
   .type-vegetable { background: #edf5ee; color: #3d6b41; }
   .type-carbs { background: #fdf8ec; color: #8a6b1a; }
   .type-soup { background: #eff3f8; color: #2d5a8a; }
+  .type-small-dishes { background: #f3eff8; color: #5b3d8a; }
 
   /* MODAL */
   .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(26,22,18,0.55); z-index: 1000; align-items: center; justify-content: center; backdrop-filter: blur(2px); }
@@ -176,6 +177,7 @@
   .chip-vegetable { background: #edf5ee; color: #3d6b41; }
   .chip-carbs { background: #fdf8ec; color: #8a6b1a; }
   .chip-soup { background: #eff3f8; color: #2d5a8a; }
+  .chip-small-dishes { background: #f3eff8; color: #5b3d8a; }
   .nutrition-warning { font-family: 'DM Mono', monospace; font-size: 11px; color: #c05a0a; background: #fef3e8; border: 1px solid #fad9b5; padding: 7px 12px; border-radius: 2px; margin-bottom: 14px; display: none; }
 
   /* SHARE PAGE */
@@ -379,6 +381,7 @@
         <option value="vegetable">🥦 Vegetable</option>
         <option value="carbs">🍚 Carbs</option>
         <option value="soup">🍜 Soup</option>
+        <option value="small dishes">🥢 Small dishes</option>
       </select>
     </div>
     <div class="form-group">
@@ -484,8 +487,8 @@ function switchAuthTab(tab) { document.getElementById('auth-error').style.displa
 // STATE
 const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 const MTIMES = ['lunch','dinner'];
-const TYPES = ['protein','vegetable','carbs','soup'];
-const EMOJI = {protein:'🥩',vegetable:'🥦',carbs:'🍚',soup:'🍜'};
+const TYPES = ['protein','vegetable','carbs','soup','small dishes'];
+const EMOJI = {protein:'🥩',vegetable:'🥦',carbs:'🍚',soup:'🍜','small dishes':'🥢'};
 
 function defaultPrefs() { const p={}; MTIMES.forEach(m=>{p[m]={protein:2,vegetable:1,carbs:0,soup:0};}); return p; }
 function defaultConfig() { const c={}; DAYS.forEach(d=>{c[d]={lunch:false,dinner:false};}); return c; }
@@ -546,7 +549,7 @@ function renderLibrary() {
     <tbody>${state.dishes.map(d=>`<tr>
       <td>${d.image_url?`<img class="dish-thumb" src="${esc(d.image_url)}">`:`<div class="dish-thumb-placeholder">${EMOJI[d.meal_type]||'🍽'}</div>`}</td>
       <td class="dish-name-cell">${esc(d.meal_name)}</td>
-      <td><span class="type-badge type-${d.meal_type}">${EMOJI[d.meal_type]} ${d.meal_type}</span></td>
+      <td><span class="type-badge ${typeClass(d.meal_type)}">${EMOJI[d.meal_type]} ${d.meal_type}</span></td>
       <td><div class="ing-chips">${(d.ingredients||[]).slice(0,3).map(i=>`<span class="ing-chip">${esc(i)}</span>`).join('')}${(d.ingredients||[]).length>3?`<span class="ing-chip">+${(d.ingredients||[]).length-3}</span>`:''}</div></td>
       <td class="dish-remarks-cell" title="${esc(d.remarks||'')}">${esc(d.remarks||'—')}</td>
       <td><div class="row-actions"><button class="btn btn-secondary btn-xs" onclick="openDishModal('${d.id}')">Edit</button><button class="btn btn-danger btn-xs" onclick="deleteDish('${d.id}')">Del</button></div></td>
@@ -703,7 +706,7 @@ function updateNutritionSummary() {
   if (warnings.length) { wEl.style.display='block'; wEl.textContent='⚠️ '+warnings.slice(0,4).join(' · ')+(warnings.length>4?` +${warnings.length-4} more`:''); }
   else { wEl.style.display='none'; }
   const total=Object.values(counts).reduce((a,b)=>a+b,0);
-  document.getElementById('nutrition-summary').innerHTML=TYPES.map(t=>`<div class="nutrition-chip chip-${t}"><span class="count">${counts[t]}</span>${EMOJI[t]} ${t}</div>`).join('')+`<div style="flex:1"></div><div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--ink-muted);align-self:center">${total} dishes total</div>`;
+  document.getElementById('nutrition-summary').innerHTML=TYPES.map(t=>`<div class="nutrition-chip chip-${t.replace(/\s+/g,'-')}"><span class="count">${counts[t]}</span>${EMOJI[t]} ${t}</div>`).join('')+`<div style="flex:1"></div><div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--ink-muted);align-self:center">${total} dishes total</div>`;
 }
 
 function autoFillPlan() {
@@ -966,7 +969,7 @@ function loadHtml2Canvas() {
 }
 
 // UTILS
-function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function typeClass(t) { return 'type-' + t.replace(/\s+/g, '-'); }
 function toast(msg,type='success') { const el=document.createElement('div'); el.className=`toast ${type}`; el.textContent=msg; document.getElementById('toast-container').appendChild(el); setTimeout(()=>el.remove(),3000); }
 
 (function(){
