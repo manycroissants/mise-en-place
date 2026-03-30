@@ -454,7 +454,10 @@ async function tryRefreshToken() {
     });
     const d = await r.json();
     if (d.error || !d.access_token) return false;
-    setSession(d.access_token, d.user.id, d.user.email, d.refresh_token);
+    // user object may be at d.user or absent — fall back to what we already know
+    const uid   = d.user?.id    || s.userId;
+    const email = d.user?.email || s.email;
+    setSession(d.access_token, uid, email, d.refresh_token || s.refreshToken);
     return true;
   } catch(e) { return false; }
 }
@@ -503,8 +506,15 @@ async function handleSignup() {
     const r = await fetch(`${SB_URL}/auth/v1/signup`, { method:'POST', headers:{apikey:SB_KEY,'Content-Type':'application/json'}, body:JSON.stringify({email,password:pwd,data:{full_name:name}}) });
     const d = await r.json();
     if (d.error) throw new Error(d.error_description || d.error);
-    if (d.access_token) { setSession(d.access_token, d.user.id, d.user.email, d.refresh_token); enterApp(); }
-    else { showAuthError('Account created! Please sign in.'); switchAuthTab('login'); }
+    // Auto-confirmed: access_token + user both present
+    if (d.access_token && d.user?.id) {
+      setSession(d.access_token, d.user.id, d.user.email, d.refresh_token);
+      enterApp();
+    } else {
+      // Email confirmation required — direct them to sign in
+      showAuthError('Account created! Please sign in.');
+      switchAuthTab('login');
+    }
   } catch(e) { showAuthError(e.message); }
   setAuthLoading('signup-btn', false);
 }
@@ -1011,9 +1021,13 @@ function toast(msg,type='success') { const el=document.createElement('div'); el.
   if (saved) {
     try {
       const s = JSON.parse(saved);
+      // Restore what we know immediately so currentUserId is set
       authToken = s.token; currentUserId = s.userId; currentUserEmail = s.email;
-      // Proactively refresh the token so it's fresh before loading data
-      if (s.refreshToken) await tryRefreshToken();
+      // Try to get a fresh token — if no refresh token or it fails, proceed anyway
+      // (the db() function will handle 401s at query time)
+      if (s.refreshToken) {
+        await tryRefreshToken().catch(() => {});
+      }
       enterApp(); return;
     } catch(e) {}
   }
