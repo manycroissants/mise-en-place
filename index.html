@@ -257,7 +257,7 @@
 <body>
 
 <!-- AUTH -->
-<div id="auth-screen">
+<div id="auth-screen" style="display:none">
   <div class="auth-card">
     <div class="auth-logo">
       <span class="wordmark">Eat what?</span>
@@ -1040,17 +1040,27 @@ function toast(msg,type='success') { const el=document.createElement('div'); el.
   if (saved) {
     try {
       const s = JSON.parse(saved);
-      // Restore what we know immediately so currentUserId is set
-      authToken = s.token; currentUserId = s.userId; currentUserEmail = s.email;
-      // Try to get a fresh token — if no refresh token or it fails, proceed anyway
-      // (the db() function will handle 401s at query time)
-      if (s.refreshToken) {
-        await tryRefreshToken().catch(() => {});
+      // Validate session has required fields
+      if (!s.token || !s.userId) {
+        localStorage.removeItem('mep_session');
+        document.getElementById('auth-screen').style.display = 'flex';
+        return;
       }
-      enterApp(); return;
-    } catch(e) {}
+      authToken = s.token;
+      currentUserId = s.userId;
+      currentUserEmail = s.email;
+      // Try refresh separately — never let it block enterApp
+      if (s.refreshToken) {
+        try { await tryRefreshToken(); } catch(e) {}
+      }
+      enterApp();
+      return;
+    } catch(e) {
+      // Corrupt session — clear it
+      localStorage.removeItem('mep_session');
+    }
   }
-  document.getElementById('auth-screen').style.display='flex';
+  document.getElementById('auth-screen').style.display = 'flex';
 })();
 
 document.addEventListener('keydown',e=>{ if(e.key==='Escape')closeDishModal(); });
