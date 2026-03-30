@@ -419,6 +419,14 @@ const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 
 let authToken = null, currentUserId = null, currentUserEmail = null;
 
+// --- UTILITIES ---
+function esc(str) {
+  if (!str) return '';
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+  
 async function db(path, opts = {}) {
   // Cleanly separate our custom keys from real fetch init properties
   const { prefer, headers: extraHeaders, ...fetchInit } = opts;
