@@ -420,22 +420,27 @@ const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 let authToken = null, currentUserId = null, currentUserEmail = null;
 
 async function db(path, opts = {}) {
-  const res = await fetch(`${SB_URL}/rest/v1/${path}`, {
-    headers: { apikey: SB_KEY, Authorization: `Bearer ${authToken || SB_KEY}`, 'Content-Type': 'application/json', Prefer: opts.prefer ?? 'return=representation', ...opts.headers },
-    ...opts
-  });
+  // Cleanly separate our custom keys from real fetch init properties
+  const { prefer, headers: extraHeaders, ...fetchInit } = opts;
+  const headers = {
+    apikey: SB_KEY,
+    Authorization: `Bearer ${authToken || SB_KEY}`,
+    'Content-Type': 'application/json',
+    Prefer: prefer ?? 'return=representation',
+    ...extraHeaders
+  };
+
+  const res = await fetch(`${SB_URL}/rest/v1/${path}`, { ...fetchInit, headers });
+
   if (res.status === 401) {
-    // Token expired — try to refresh, then retry once
     const refreshed = await tryRefreshToken();
     if (refreshed) {
-      const res2 = await fetch(`${SB_URL}/rest/v1/${path}`, {
-        headers: { apikey: SB_KEY, Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json', Prefer: opts.prefer ?? 'return=representation', ...opts.headers },
-        ...opts
-      });
+      // Retry with the new token
+      const headers2 = { ...headers, Authorization: `Bearer ${authToken}` };
+      const res2 = await fetch(`${SB_URL}/rest/v1/${path}`, { ...fetchInit, headers: headers2 });
       if (!res2.ok) { const e = await res2.json().catch(()=>({})); throw new Error(e.message || res2.statusText); }
       const t2 = await res2.text(); return t2 ? JSON.parse(t2) : null;
     }
-    // Refresh failed — kick back to login
     handleLogout(); throw new Error('Session expired. Please sign in again.');
   }
   if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.message || res.statusText); }
