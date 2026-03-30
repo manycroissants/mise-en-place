@@ -487,6 +487,14 @@ function compressImage(file, maxSize = 200, quality = 0.6) {
   });
 }
 
+// Decode JWT payload — most reliable source of uid regardless of API response shape
+function decodeJWT(token) {
+  try {
+    const payload = token.split('.')[1];
+    return JSON.parse(atob(payload.replace(/-/g,'+').replace(/_/g,'/')));
+  } catch(e) { return {}; }
+}
+
 // AUTH
 async function handleLogin() {
   const email = document.getElementById('login-email').value.trim();
@@ -496,7 +504,12 @@ async function handleLogin() {
     const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, { method:'POST', headers:{apikey:SB_KEY,'Content-Type':'application/json'}, body:JSON.stringify({email,password:pwd}) });
     const d = await r.json();
     if (d.error) throw new Error(d.error_description || d.error);
-    setSession(d.access_token, d.user.id, d.user.email, d.refresh_token); enterApp();
+    const jwt = decodeJWT(d.access_token);
+    const uid = d.user?.id || jwt.sub;
+    const userEmail = d.user?.email || jwt.email || email;
+    if (!uid) throw new Error('Could not determine user ID. Please try again.');
+    setSession(d.access_token, uid, userEmail, d.refresh_token);
+    enterApp();
   } catch(e) { showAuthError(e.message); }
   setAuthLoading('login-btn', false);
 }
@@ -511,12 +524,13 @@ async function handleSignup() {
     const r = await fetch(`${SB_URL}/auth/v1/signup`, { method:'POST', headers:{apikey:SB_KEY,'Content-Type':'application/json'}, body:JSON.stringify({email,password:pwd,data:{full_name:name}}) });
     const d = await r.json();
     if (d.error) throw new Error(d.error_description || d.error);
-    // Auto-confirmed: access_token + user both present
-    if (d.access_token && d.user?.id) {
-      setSession(d.access_token, d.user.id, d.user.email, d.refresh_token);
+    if (d.access_token) {
+      const jwt = decodeJWT(d.access_token);
+      const uid = d.user?.id || jwt.sub;
+      const userEmail = d.user?.email || jwt.email || email;
+      setSession(d.access_token, uid, userEmail, d.refresh_token);
       enterApp();
     } else {
-      // Email confirmation required — direct them to sign in
       showAuthError('Account created! Please sign in.');
       switchAuthTab('login');
     }
