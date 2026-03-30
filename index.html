@@ -424,8 +424,39 @@ async function db(path, opts = {}) {
     headers: { apikey: SB_KEY, Authorization: `Bearer ${authToken || SB_KEY}`, 'Content-Type': 'application/json', Prefer: opts.prefer ?? 'return=representation', ...opts.headers },
     ...opts
   });
+  if (res.status === 401) {
+    // Token expired — try to refresh, then retry once
+    const refreshed = await tryRefreshToken();
+    if (refreshed) {
+      const res2 = await fetch(`${SB_URL}/rest/v1/${path}`, {
+        headers: { apikey: SB_KEY, Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json', Prefer: opts.prefer ?? 'return=representation', ...opts.headers },
+        ...opts
+      });
+      if (!res2.ok) { const e = await res2.json().catch(()=>({})); throw new Error(e.message || res2.statusText); }
+      const t2 = await res2.text(); return t2 ? JSON.parse(t2) : null;
+    }
+    // Refresh failed — kick back to login
+    handleLogout(); throw new Error('Session expired. Please sign in again.');
+  }
   if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.message || res.statusText); }
   const t = await res.text(); return t ? JSON.parse(t) : null;
+}
+
+async function tryRefreshToken() {
+  const saved = localStorage.getItem('mep_session');
+  if (!saved) return false;
+  try {
+    const s = JSON.parse(saved);
+    if (!s.refreshToken) return false;
+    const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=refresh_token`, {
+      method: 'POST', headers: { apikey: SB_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: s.refreshToken })
+    });
+    const d = await r.json();
+    if (d.error || !d.access_token) return false;
+    setSession(d.access_token, d.user.id, d.user.email, d.refresh_token);
+    return true;
+  } catch(e) { return false; }
 }
 
 // ── IMAGE COMPRESSION ──
@@ -457,7 +488,7 @@ async function handleLogin() {
     const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, { method:'POST', headers:{apikey:SB_KEY,'Content-Type':'application/json'}, body:JSON.stringify({email,password:pwd}) });
     const d = await r.json();
     if (d.error) throw new Error(d.error_description || d.error);
-    setSession(d.access_token, d.user.id, d.user.email); enterApp();
+    setSession(d.access_token, d.user.id, d.user.email, d.refresh_token); enterApp();
   } catch(e) { showAuthError(e.message); }
   setAuthLoading('login-btn', false);
 }
@@ -472,13 +503,16 @@ async function handleSignup() {
     const r = await fetch(`${SB_URL}/auth/v1/signup`, { method:'POST', headers:{apikey:SB_KEY,'Content-Type':'application/json'}, body:JSON.stringify({email,password:pwd,data:{full_name:name}}) });
     const d = await r.json();
     if (d.error) throw new Error(d.error_description || d.error);
-    if (d.access_token) { setSession(d.access_token, d.user.id, d.user.email); enterApp(); }
+    if (d.access_token) { setSession(d.access_token, d.user.id, d.user.email, d.refresh_token); enterApp(); }
     else { showAuthError('Account created! Please sign in.'); switchAuthTab('login'); }
   } catch(e) { showAuthError(e.message); }
   setAuthLoading('signup-btn', false);
 }
 
-function setSession(token, uid, email) { authToken=token; currentUserId=uid; currentUserEmail=email; localStorage.setItem('mep_session', JSON.stringify({token,userId:uid,email})); }
+function setSession(token, uid, email, refreshToken) {
+  authToken=token; currentUserId=uid; currentUserEmail=email;
+  localStorage.setItem('mep_session', JSON.stringify({token, userId:uid, email, refreshToken: refreshToken||null}));
+}
 function handleLogout() { localStorage.removeItem('mep_session'); authToken=null; currentUserId=null; state=freshState(); document.getElementById('app').style.display='none'; document.getElementById('auth-screen').style.display='flex'; }
 function setAuthLoading(id, on) { const b=document.getElementById(id); b.disabled=on; b.innerHTML=on?'<span class="loading-spinner"></span>':(id==='login-btn'?'Sign in':'Create account'); }
 function showAuthError(m) { const e=document.getElementById('auth-error'); e.textContent=m; e.style.display='block'; }
@@ -972,9 +1006,17 @@ function loadHtml2Canvas() {
 function typeClass(t) { return 'type-' + t.replace(/\s+/g, '-'); }
 function toast(msg,type='success') { const el=document.createElement('div'); el.className=`toast ${type}`; el.textContent=msg; document.getElementById('toast-container').appendChild(el); setTimeout(()=>el.remove(),3000); }
 
-(function(){
-  const saved=localStorage.getItem('mep_session');
-  if (saved) { try { const s=JSON.parse(saved); authToken=s.token; currentUserId=s.userId; currentUserEmail=s.email; enterApp(); return; } catch(e){} }
+(async function(){
+  const saved = localStorage.getItem('mep_session');
+  if (saved) {
+    try {
+      const s = JSON.parse(saved);
+      authToken = s.token; currentUserId = s.userId; currentUserEmail = s.email;
+      // Proactively refresh the token so it's fresh before loading data
+      if (s.refreshToken) await tryRefreshToken();
+      enterApp(); return;
+    } catch(e) {}
+  }
   document.getElementById('auth-screen').style.display='flex';
 })();
 
